@@ -1,9 +1,11 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")  # Headless-Backend für Streamlit/Server
 import matplotlib.pyplot as plt
 from io import BytesIO
+from pathlib import Path
 
 st.set_page_config(page_title="Installer Economics – v2", layout="wide")
 
@@ -80,6 +82,57 @@ def default_projects():
     ]
     return pd.DataFrame(rows, columns=["Stadt","Objekt","Wasserzähler","WMZ","KMZ","HKV"])
 
+# ------------------ Persistenz: Rates CSV ------------------
+ASSETS_RATES_CSV = Path("assets/zaehler_parameter.csv")
+
+def load_rates_from_assets() -> pd.DataFrame:
+    """Lade Rates aus CSV, fallback auf default_rates(). Spalten-Sanitisierung inklusive."""
+    if ASSETS_RATES_CSV.exists():
+        df = pd.read_csv(ASSETS_RATES_CSV)
+        # Mögliche ältere Spaltennamen abbilden
+        rename_map = {
+            "Geraet": "Gerät",
+            "Montageaufwand_h": "Montageaufwand (h)",
+            "Preis_EUR": "Vergütung pro Gerät (€)",
+        }
+        df = df.rename(columns=rename_map)
+        needed = {"Kategorie","Gerät","Montageaufwand (h)","Vergütung pro Gerät (€)"}
+        if not needed.issubset(df.columns):
+            df = default_rates()
+        df["Montageaufwand (h)"] = pd.to_numeric(df["Montageaufwand (h)"], errors="coerce").fillna(0.0).clip(lower=0.0)
+        df["Vergütung pro Gerät (€)"] = pd.to_numeric(df["Vergütung pro Gerät (€)"], errors="coerce").fillna(0.0).clip(lower=0.0)
+        if "Einheiten/Woche" not in df.columns:
+            df["Einheiten/Woche"] = 0
+        return df
+    return default_rates()
+
+def save_rates_to_assets(df: pd.DataFrame) -> None:
+    ASSETS_RATES_CSV.parent.mkdir(parents=True, exist_ok=True)
+    cols = ["Kategorie","Gerät","Montageaufwand (h)","Vergütung pro Gerät (€)"]
+    df = df.copy()
+    (df[cols]).to_csv(ASSETS_RATES_CSV, index=False)
+
+def compute_project_totals(projects_df: pd.DataFrame) -> dict:
+    def _to_num(x):
+        if isinstance(x,str) and "-" in x:
+            a,b = x.split("-",1)
+            try:
+                return (float(a)+float(b))/2.0
+            except:
+                return np.nan
+        try:
+            return float(x)
+        except:
+            return np.nan
+    cats = ["Wasserzähler","WMZ","KMZ","HKV"]
+    totals = {}
+    for c in cats:
+        if c in projects_df.columns:
+            totals[c] = pd.to_numeric(projects_df[c].apply(_to_num), errors="coerce").sum(skipna=True)
+        else:
+            totals[c] = 0.0
+    return totals
+
 # ------------------ Sidebar: Inputs ------------------
 st.sidebar.header("Basiswerte")
 inp = default_inputs()
@@ -102,11 +155,52 @@ tab1, tab2, tab3, tab4 = st.tabs(["1) Gerätekatalog", "2) Mix (Projekt→Gerät
 
 with tab1:
     st.subheader("Geräte, Zeiten & Vergütung")
-    rates = default_rates()
-    rates = st.data_editor(rates, num_rows="dynamic", use_container_width=True, hide_index=True, key="rates")
+    # Session-gestützte Tabelle, initial aus CSV oder Defaults
+    if "rates" not in st.session_state:
+        st.session_state["rates"] = load_rates_from_assets()
+    rates = st.data_editor(
+        st.session_state["rates"],
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        key="rates_editor"
+    )
+    st.session_state["rates"] = rates
+
+    with st.expander("CSV Import/Export & Speichern", expanded=False):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.download_button(
+                "CSV exportieren",
+                data=st.session_state["rates"][["Kategorie","Gerät","Montageaufwand (h)","Vergütung pro Gerät (€)"]].to_csv(index=False).encode("utf-8"),
+                file_name="zaehler_parameter.csv",
+                mime="text/csv",
+            )
+        with c2:
+            up = st.file_uploader("CSV importieren", type=["csv"])
+            if up is not None:
+                try:
+                    imp = pd.read_csv(up)
+                    needed = {"Kategorie","Gerät","Montageaufwand (h)","Vergütung pro Gerät (€)"}
+                    if not needed.issubset(imp.columns):
+                        st.error("CSV benötigt die Spalten: Kategorie, Gerät, Montageaufwand (h), Vergütung pro Gerät (€).")
+                    else:
+                        imp["Montageaufwand (h)"] = pd.to_numeric(imp["Montageaufwand (h)"], errors="coerce").fillna(0.0).clip(lower=0.0)
+                        imp["Vergütung pro Gerät (€)"] = pd.to_numeric(imp["Vergütung pro Gerät (€)"], errors="coerce").fillna(0.0).clip(lower=0.0)
+                        if "Einheiten/Woche" not in imp.columns:
+                            imp["Einheiten/Woche"] = 0
+                        st.session_state["rates"] = imp
+                        st.success("CSV importiert.")
+                except Exception as e:
+                    st.error(f"CSV konnte nicht gelesen werden: {e}")
+        with c3:
+            if st.button("Als Standard speichern"):
+                save_rates_to_assets(st.session_state["rates"])
+                st.success(f"Gespeichert nach: {ASSETS_RATES_CSV}")
 
 with tab2:
     st.subheader("Verteilungsschlüssel je Kategorie")
+    rates = st.session_state.get("rates", default_rates())
     if "mix" not in st.session_state:
         st.session_state["mix"] = default_mix(rates)
     # adjust mix if new devices/categories appear
@@ -114,51 +208,57 @@ with tab2:
     for _, r in rates.iterrows():
         pair = (r["Kategorie"], r["Gerät"])
         if pair not in existing_pairs:
-            st.session_state["mix"] = pd.concat([st.session_state["mix"], pd.DataFrame([{"Kategorie": r["Kategorie"], "Gerät": r["Gerät"], "Anteil (0..1)": 0.0}])], ignore_index=True)
-    mix = st.data_editor(st.session_state["mix"], num_rows="dynamic", use_container_width=True, hide_index=True, key="mix_editor")
+            st.session_state["mix"] = pd.concat(
+                [st.session_state["mix"], pd.DataFrame([{"Kategorie": r["Kategorie"], "Gerät": r["Gerät"], "Anteil (0..1)": 0.0}])],
+                ignore_index=True
+            )
+    mix = st.data_editor(
+        st.session_state["mix"],
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        key="mix_editor"
+    )
+    st.session_state["mix"] = mix
     st.caption("Hinweis: Die Summe der Anteile pro Kategorie sollte 1.0 (100%) ergeben.")
 
 with tab3:
     st.subheader("Projektpipeline (Summen je Kategorie)")
-    projects = default_projects()
-    projects = st.data_editor(projects, num_rows="dynamic", use_container_width=True, hide_index=True, key="projects")
-    # compute project totals per category
-    def _to_num(x):
-        if isinstance(x,str) and "-" in x:
-            a,b = x.split("-",1)
-            try:
-                return (float(a)+float(b))/2.0
-            except:
-                return np.nan
-        try:
-            return float(x)
-        except:
-            return np.nan
-    cats = ["Wasserzähler","WMZ","KMZ","HKV"]
-    totals = {}
-    for i,c in enumerate(cats, start=0):
-        if c in projects.columns:
-            totals[c] = pd.to_numeric(projects[c].apply(_to_num), errors="coerce").sum(skipna=True)
-        else:
-            totals[c] = 0.0
+    if "projects" not in st.session_state:
+        st.session_state["projects"] = default_projects()
+    projects = st.data_editor(
+        st.session_state["projects"],
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        key="projects_editor"
+    )
+    st.session_state["projects"] = projects
+
+    totals = compute_project_totals(projects)
+    st.session_state["project_totals"] = totals
     st.write("**Projektsummen (über alle Zeilen):**", {k:int(v) for k,v in totals.items()})
 
 with tab4:
     st.subheader("Planung")
-    # compute available units per device from projects & mix
-    mix_ok = mix.copy()
+    # Pull latest from state
+    rates = st.session_state.get("rates", default_rates())
+    mix = st.session_state.get("mix", default_mix(rates)).copy()
+    projects = st.session_state.get("projects", default_projects())
+    totals = st.session_state.get("project_totals", compute_project_totals(projects))
+
     # normalize shares per category to sum to 1 (robust)
-    for cat, sub in mix_ok.groupby("Kategorie"):
+    for cat, sub in mix.groupby("Kategorie"):
         s = sub["Anteil (0..1)"].sum()
         if s > 0:
-            mix_ok.loc[sub.index, "Anteil (0..1)"] = sub["Anteil (0..1)"] / s
+            mix.loc[sub.index, "Anteil (0..1)"] = sub["Anteil (0..1)"] / s
 
     available = []
     for _, r in rates.iterrows():
         cat = r["Kategorie"]
         device = r["Gerät"]
-        share = mix_ok[(mix_ok["Kategorie"]==cat) & (mix_ok["Gerät"]==device)]["Anteil (0..1)"]
-        share = float(share.iloc[0]) if len(share)>0 else 0.0
+        share_series = mix[(mix["Kategorie"]==cat) & (mix["Gerät"]==device)]["Anteil (0..1)"]
+        share = float(share_series.iloc[0]) if len(share_series)>0 else 0.0
         if cat == "Wasserzähler":
             base = totals.get("Wasserzähler", 0.0)
         elif cat == "Wärmezähler / Kältezähler":
@@ -175,7 +275,8 @@ with tab4:
         available.append(avail)
     plan_df = rates.copy()
     plan_df["Verfügbar (aus Projekten)"] = available
-    plan_df["Einheiten/Woche"] = 0
+    if "Einheiten/Woche" not in plan_df.columns:
+        plan_df["Einheiten/Woche"] = 0
 
     st.write("**Verfügbare Einheiten (abgeleitet aus Projekten × Mix):**")
     st.dataframe(plan_df[["Kategorie","Gerät","Montageaufwand (h)","Vergütung pro Gerät (€)","Verfügbar (aus Projekten)"]], use_container_width=True)
@@ -263,9 +364,9 @@ with tab4:
             inputs_df = pd.DataFrame(list(inp.items()), columns=["Parameter","Wert"])
             inputs_df.to_excel(writer, sheet_name="Inputs", index=False)
 
-            rates.to_excel(writer, sheet_name="Rates", index=False)
-            mix.to_excel(writer, sheet_name="Mix", index=False)
-            projects.to_excel(writer, sheet_name="Projects", index=False)
+            st.session_state.get("rates", default_rates()).to_excel(writer, sheet_name="Rates", index=False)
+            st.session_state.get("mix", default_mix(rates)).to_excel(writer, sheet_name="Mix", index=False)
+            st.session_state.get("projects", default_projects()).to_excel(writer, sheet_name="Projects", index=False)
             editable_plan.to_excel(writer, sheet_name="WeeklyPlan", index=False)
 
             summary = pd.DataFrame({
